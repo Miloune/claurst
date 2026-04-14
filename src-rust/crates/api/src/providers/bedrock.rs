@@ -369,7 +369,7 @@ impl BedrockProvider {
                     None
                 }
             }
-            ContentBlock::ToolUse { id, name, input } => Some(json!({
+            ContentBlock::ToolUse { id, name, input, .. } => Some(json!({
                 "toolUse": {
                     "toolUseId": id,
                     "name": name,
@@ -591,7 +591,7 @@ impl BedrockProvider {
                         .unwrap_or("")
                         .to_string();
                     let input = tu.get("input").cloned().unwrap_or(json!({}));
-                    return Some(ContentBlock::ToolUse { id, name, input });
+                    return Some(ContentBlock::ToolUse { id, name, input, thought_signature: None });
                 }
                 None
             })
@@ -901,6 +901,7 @@ fn parse_bedrock_event(
                     id,
                     name,
                     input: json!({}),
+                    thought_signature: None,
                 },
             }));
         } else {

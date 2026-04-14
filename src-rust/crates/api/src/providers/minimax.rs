@@ -190,7 +190,7 @@ impl LlmProvider for MinimaxProvider {
                         ContentBlock::ToolUse {
                             id: tool_id,
                             name,
-                            input: _,
+                            ..
                         } => {
                             tool_buffers.insert(index, (tool_id, name, String::new()));
                         }
@@ -219,6 +219,7 @@ impl LlmProvider for MinimaxProvider {
                                 id: tool_id,
                                 name,
                                 input,
+                                thought_signature: None,
                             });
                         }
                     }

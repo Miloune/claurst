@@ -200,6 +200,11 @@ pub mod types {
             id: String,
             name: String,
             input: Value,
+            /// Opaque token returned by Google Gemini alongside a functionCall part.
+            /// Must be round-tripped back in subsequent requests to preserve
+            /// the model's chain-of-thought across tool calls.
+            #[serde(skip_serializing_if = "Option::is_none")]
+            thought_signature: Option<String>,
         },
         ToolResult {
             tool_use_id: String,

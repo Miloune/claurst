@@ -384,6 +384,7 @@ impl LlmProvider for AzureProvider {
                                         id: tc_id.to_string(),
                                         name,
                                         input: serde_json::json!({}),
+                                        thought_signature: None,
                                     },
                                 });
                             }

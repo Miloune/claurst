@@ -156,12 +156,22 @@ impl GoogleProvider {
                 }
             }
 
-            ContentBlock::ToolUse { name, input, .. } => Some(json!({
-                "functionCall": {
+            ContentBlock::ToolUse { name, input, thought_signature, .. } => {
+                let function_call = json!({
                     "name": name,
                     "args": input
+                });
+
+                // Round-trip the thought signature so Gemini can resume its
+                // chain-of-thought across tool calls (multi-turn reasoning).
+                // Per the Gemini API spec, thoughtSignature is a sibling of
+                // functionCall at the part level, NOT nested inside functionCall.
+                let mut part = json!({ "functionCall": function_call });
+                if let Some(sig) = thought_signature {
+                    part["thoughtSignature"] = json!(sig);
                 }
-            })),
+                Some(part)
+            }
 
             // Thinking blocks are not supported by Gemini — drop silently.
             ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } => None,
@@ -549,10 +559,18 @@ impl GoogleProvider {
                         .and_modify(|count| *count += 1)
                         .or_insert(0);
                     let id = Self::tool_use_id_for_name(&name, *occurrence);
+                    // thoughtSignature is a sibling of functionCall at the part
+                    // level (not nested inside functionCall). Preserve it for
+                    // round-tripping in subsequent requests.
+                    let thought_signature = part
+                        .get("thoughtSignature")
+                        .and_then(|s| s.as_str())
+                        .map(|s| s.to_string());
                     content_blocks.push(ContentBlock::ToolUse {
                         id,
                         name,
                         input: args,
+                        thought_signature,
                     });
                 }
             }
@@ -697,7 +715,11 @@ impl LlmProvider for GoogleProvider {
             let mut byte_stream = byte_stream;
             let text_block_index: usize = 0;
             let mut tool_block_index: usize = 1000;
-            let mut open_tool_calls: std::collections::HashMap<usize, (usize, String, String)> =
+            // open_tool_calls: part_idx → (block_idx, id, name, thought_signature)
+            // thought_signature is stored so it can be updated if a later SSE chunk
+            // delivers it (Google sends cumulative snapshots, so the final chunk
+            // for a function call is the authoritative one).
+            let mut open_tool_calls: std::collections::HashMap<usize, (usize, String, String, Option<String>)> =
                 std::collections::HashMap::new();
             let mut emitted_message_start = false;
             let message_id = format!("gemini-{}", uuid_v4_simple());
@@ -816,8 +838,33 @@ impl LlmProvider for GoogleProvider {
                                             .map(|a| a.to_string())
                                             .unwrap_or_else(|| "{}".to_string());
 
-                                        let idx = if let Some((existing_idx, _, _)) = open_tool_calls.get(&part_idx) {
-                                            *existing_idx
+                                        // thoughtSignature is at the part level
+                                        // (sibling of functionCall), not inside it.
+                                        let thought_signature = part
+                                            .get("thoughtSignature")
+                                            .and_then(|s| s.as_str())
+                                            .map(|s| s.to_string());
+
+                                        let idx = if let Some((existing_idx, existing_id, _, stored_sig)) = open_tool_calls.get_mut(&part_idx) {
+                                            let idx = *existing_idx;
+                                            // If this later chunk delivers a thoughtSignature that
+                                            // the initial ContentBlockStart lacked, re-emit it so
+                                            // the accumulator can pick up the definitive value.
+                                            // Google's SSE is cumulative: the final chunk for a
+                                            // part is authoritative, so re-emitting is safe.
+                                            if stored_sig.is_none() && thought_signature.is_some() {
+                                                *stored_sig = thought_signature.clone();
+                                                yield Ok(StreamEvent::ContentBlockStart {
+                                                    index: idx,
+                                                    content_block: ContentBlock::ToolUse {
+                                                        id: existing_id.clone(),
+                                                        name: name.clone(),
+                                                        input: json!({}),
+                                                        thought_signature,
+                                                    },
+                                                });
+                                            }
+                                            idx
                                         } else {
                                             let occurrence = tool_name_counts
                                                 .entry(name.clone())
@@ -826,13 +873,14 @@ impl LlmProvider for GoogleProvider {
                                             let id = Self::tool_use_id_for_name(&name, *occurrence);
                                             let idx = tool_block_index;
                                             tool_block_index += 1;
-                                            open_tool_calls.insert(part_idx, (idx, id.clone(), name.clone()));
+                                            open_tool_calls.insert(part_idx, (idx, id.clone(), name.clone(), thought_signature.clone()));
                                             yield Ok(StreamEvent::ContentBlockStart {
                                                 index: idx,
                                                 content_block: ContentBlock::ToolUse {
                                                     id,
                                                     name: name.clone(),
                                                     input: json!({}),
+                                                    thought_signature,
                                                 },
                                             });
                                             idx
@@ -864,7 +912,7 @@ impl LlmProvider for GoogleProvider {
                                 let mut tool_indices: Vec<usize> =
                                     open_tool_calls
                                         .values()
-                                        .map(|(idx, _, _)| *idx)
+                                        .map(|(idx, _, _, _)| *idx)
                                         .collect();
                                 tool_indices.sort_unstable();
                                 for idx in tool_indices {
@@ -1076,6 +1124,7 @@ mod tests {
                 id: "call_search_2".to_string(),
                 name: "search".to_string(),
                 input: json!({"q": "cats"}),
+                thought_signature: None,
             }]),
             Message::user_blocks(vec![ContentBlock::ToolResult {
                 tool_use_id: "call_search_2".to_string(),
@@ -1146,6 +1195,67 @@ mod tests {
         assert!(matches!(
             &parsed.content[1],
             ContentBlock::ToolUse { id, .. } if id == "call_search_2"
+        ));
+    }
+
+    #[test]
+    fn thought_signature_is_round_tripped_in_request() {
+        let provider = GoogleProvider::new("test".to_string());
+
+        // Simulate a ToolUse block that carries a thought signature from a
+        // previous Gemini response.
+        let request = test_request(vec![
+            Message::assistant_blocks(vec![ContentBlock::ToolUse {
+                id: "call_search".to_string(),
+                name: "search".to_string(),
+                input: json!({"q": "test"}),
+                thought_signature: Some("abc123sig==".to_string()),
+            }]),
+            Message::user_blocks(vec![ContentBlock::ToolResult {
+                tool_use_id: "call_search".to_string(),
+                content: ToolResultContent::Text("result".to_string()),
+                is_error: Some(false),
+            }]),
+        ]);
+
+        let body = provider.build_request_body(&request);
+        let contents = body["contents"].as_array().expect("contents array");
+
+        // The first content entry should be the model turn with the functionCall
+        // part that carries the thoughtSignature back to the API.
+        let model_part = &contents[0]["parts"][0];
+        assert_eq!(model_part["functionCall"]["name"], json!("search"));
+        // thoughtSignature must be at the part level, not inside functionCall.
+        assert_eq!(model_part["thoughtSignature"], json!("abc123sig=="));
+        assert!(model_part["functionCall"]["thoughtSignature"].is_null());
+    }
+
+    #[test]
+    fn thought_signature_is_extracted_from_response() {
+        let provider = GoogleProvider::new("test".to_string());
+        let response = json!({
+            "candidates": [{
+                "finishReason": "FUNCTION_CALL",
+                "content": {
+                    "parts": [{
+                        "functionCall": {
+                            "name": "search",
+                            "args": { "q": "test" }
+                        },
+                        "thoughtSignature": "sig_xyz=="
+                    }]
+                }
+            }],
+            "usageMetadata": {}
+        });
+
+        let parsed = provider
+            .parse_response_body(&response, "gemini-2.5-flash")
+            .expect("parsed response");
+
+        assert!(matches!(
+            &parsed.content[0],
+            ContentBlock::ToolUse { thought_signature: Some(sig), .. } if sig == "sig_xyz=="
         ));
     }
 }

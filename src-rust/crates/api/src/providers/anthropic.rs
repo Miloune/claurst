@@ -210,7 +210,7 @@ impl LlmProvider for AnthropicProvider {
                         ContentBlock::ToolUse {
                             id: tool_id,
                             name,
-                            input: _,
+                            ..
                         } => {
                             tool_buffers.insert(index, (tool_id, name, String::new()));
                         }
@@ -240,6 +240,7 @@ impl LlmProvider for AnthropicProvider {
                                 id: tool_id,
                                 name,
                                 input,
+                                thought_signature: None,
                             });
                         }
                     }
