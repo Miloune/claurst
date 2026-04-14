@@ -97,8 +97,24 @@ impl Tool for FileEditTool {
             }
         };
 
+        // If the file uses CRLF line endings, adapt the old/new strings to
+        // match so we replace in-place without changing the file's line ending
+        // style (which would show every line as modified in git).
+        // Normalise to LF first to avoid \r\r\n when the input already has CRLF.
+        let crlf = content.contains("\r\n");
+        let old_string = if crlf {
+            params.old_string.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            params.old_string.replace("\r\n", "\n")
+        };
+        let new_string = if crlf {
+            params.new_string.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            params.new_string.replace("\r\n", "\n")
+        };
+
         // Count occurrences
-        let count = content.matches(&params.old_string).count();
+        let count = content.matches(&old_string).count();
 
         if count == 0 {
             return ToolResult::error(format!(
@@ -120,10 +136,10 @@ impl Tool for FileEditTool {
 
         // Perform replacement
         let new_content = if params.replace_all {
-            content.replace(&params.old_string, &params.new_string)
+            content.replace(&old_string, &new_string)
         } else {
             // Replace only the first occurrence
-            content.replacen(&params.old_string, &params.new_string, 1)
+            content.replacen(&old_string, &new_string, 1)
         };
 
         // Write back

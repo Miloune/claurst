@@ -127,7 +127,23 @@ impl Tool for BatchEditTool {
                 }
             };
 
-            let count = content.matches(&edit.old_string).count();
+            // If the file uses CRLF line endings, adapt the old/new strings to
+            // match so we replace in-place without changing the file's line ending
+            // style (which would show every line as modified in git).
+            // Normalise to LF first to avoid \r\r\n when the input already has CRLF.
+            let crlf = content.contains("\r\n");
+            let old_string = if crlf {
+                edit.old_string.replace("\r\n", "\n").replace('\n', "\r\n")
+            } else {
+                edit.old_string.replace("\r\n", "\n")
+            };
+            let new_string = if crlf {
+                edit.new_string.replace("\r\n", "\n").replace('\n', "\r\n")
+            } else {
+                edit.new_string.replace("\r\n", "\n")
+            };
+
+            let count = content.matches(&old_string).count();
             if count == 0 {
                 pre_check_errors.push(format!(
                     "Edit {}: old_string not found in {}",
@@ -146,7 +162,7 @@ impl Tool for BatchEditTool {
                 continue;
             }
 
-            let new_content = content.replacen(&edit.old_string, &edit.new_string, 1);
+            let new_content = content.replacen(&old_string, &new_string, 1);
             prepared.push((path.display().to_string(), content, new_content));
         }
 
