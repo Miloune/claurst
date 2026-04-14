@@ -269,15 +269,26 @@ impl GoogleProvider {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                // Convert integer enums to string enums.
+                // Gemini only allows `enum` on STRING-typed fields.
+                // If a field has `enum` and its type is anything other than "string"
+                // (including absent), force type=string and stringify all values.
                 if let Some(Value::Array(enum_vals)) = map.get("enum") {
-                    if enum_vals.iter().any(|v| v.is_number()) {
+                    let type_is_string = map
+                        .get("type")
+                        .and_then(|v| v.as_str())
+                        == Some("string");
+                    if !type_is_string {
                         let string_enums: Vec<Value> = enum_vals
                             .iter()
-                            .map(|v| Value::String(v.to_string()))
+                            .map(|v| {
+                                if v.is_string() {
+                                    v.clone()
+                                } else {
+                                    Value::String(v.to_string())
+                                }
+                            })
                             .collect();
                         map.insert("enum".to_string(), Value::Array(string_enums));
-                        // Upgrade type to string when converting number enums.
                         map.insert("type".to_string(), Value::String("string".to_string()));
                     }
                 }
