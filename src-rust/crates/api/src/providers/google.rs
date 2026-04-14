@@ -162,10 +162,6 @@ impl GoogleProvider {
                     "args": input
                 });
 
-                // Round-trip the thought signature so Gemini can resume its
-                // chain-of-thought across tool calls (multi-turn reasoning).
-                // Per the Gemini API spec, thoughtSignature is a sibling of
-                // functionCall at the part level, NOT nested inside functionCall.
                 let mut part = json!({ "functionCall": function_call });
                 if let Some(sig) = thought_signature {
                     part["thoughtSignature"] = json!(sig);
@@ -559,9 +555,6 @@ impl GoogleProvider {
                         .and_modify(|count| *count += 1)
                         .or_insert(0);
                     let id = Self::tool_use_id_for_name(&name, *occurrence);
-                    // thoughtSignature is a sibling of functionCall at the part
-                    // level (not nested inside functionCall). Preserve it for
-                    // round-tripping in subsequent requests.
                     let thought_signature = part
                         .get("thoughtSignature")
                         .and_then(|s| s.as_str())
@@ -847,11 +840,6 @@ impl LlmProvider for GoogleProvider {
 
                                         let idx = if let Some((existing_idx, existing_id, _, stored_sig)) = open_tool_calls.get_mut(&part_idx) {
                                             let idx = *existing_idx;
-                                            // If this later chunk delivers a thoughtSignature that
-                                            // the initial ContentBlockStart lacked, re-emit it so
-                                            // the accumulator can pick up the definitive value.
-                                            // Google's SSE is cumulative: the final chunk for a
-                                            // part is authoritative, so re-emitting is safe.
                                             if stored_sig.is_none() && thought_signature.is_some() {
                                                 *stored_sig = thought_signature.clone();
                                                 yield Ok(StreamEvent::ContentBlockStart {
@@ -1221,11 +1209,8 @@ mod tests {
         let body = provider.build_request_body(&request);
         let contents = body["contents"].as_array().expect("contents array");
 
-        // The first content entry should be the model turn with the functionCall
-        // part that carries the thoughtSignature back to the API.
         let model_part = &contents[0]["parts"][0];
         assert_eq!(model_part["functionCall"]["name"], json!("search"));
-        // thoughtSignature must be at the part level, not inside functionCall.
         assert_eq!(model_part["thoughtSignature"], json!("abc123sig=="));
         assert!(model_part["functionCall"]["thoughtSignature"].is_null());
     }
