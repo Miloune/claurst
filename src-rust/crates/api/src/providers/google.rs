@@ -247,6 +247,28 @@ impl GoogleProvider {
         })
     }
 
+    /// Sanitize a function name to comply with Google's requirements:
+    /// must start with a letter or underscore, and contain only
+    /// alphanumeric chars, underscores, dots, colons, or dashes (max 128 chars).
+    fn sanitize_function_name(name: &str) -> String {
+        let sanitized: String = name
+            .chars()
+            .map(|ch| {
+                if ch.is_alphanumeric() || ch == '_' || ch == '.' || ch == ':' || ch == '-' {
+                    ch
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let sanitized = if sanitized.starts_with(|c: char| c.is_alphabetic() || c == '_') {
+            sanitized
+        } else {
+            format!("_{}", sanitized)
+        };
+        sanitized.chars().take(128).collect()
+    }
+
     /// Sanitize a JSON Schema object for Google's stricter requirements:
     /// - Integer enums → string enums
     /// - `required` must only list fields actually in `properties`
@@ -398,7 +420,9 @@ impl GoogleProvider {
                         .cloned()
                         .or_else(|| Self::infer_tool_name_from_id(tool_use_id))
                         .unwrap_or_else(|| tool_use_id.clone());
-                    tool_result_parts.push(Self::tool_result_to_part(&tool_name, content));
+                    // Google expects the sanitized name in functionResponse (same as what we sent).
+                    let tool_name_for_google = Self::sanitize_function_name(&tool_name);
+                    tool_result_parts.push(Self::tool_result_to_part(&tool_name_for_google, content));
                 } else if let Some(part) = Self::content_block_to_part(block) {
                     flush_tool_result_parts(&mut contents, &mut tool_result_parts);
                     regular_parts.push(part);
@@ -431,7 +455,7 @@ impl GoogleProvider {
                 .iter()
                 .map(|td| {
                     json!({
-                        "name": td.name,
+                        "name": Self::sanitize_function_name(&td.name),
                         "description": td.description,
                         "parameters": Self::sanitize_schema(td.input_schema.clone())
                     })
@@ -502,11 +526,28 @@ impl GoogleProvider {
         parse_http_error(status, body, &self.id)
     }
 
+    /// Build a mapping from sanitized function name → original tool name.
+    /// Used to restore original names when Google echoes back sanitized names.
+    fn build_sanitized_name_map(tools: &[claurst_core::types::ToolDefinition]) -> std::collections::HashMap<String, String> {
+        tools
+            .iter()
+            .filter_map(|td| {
+                let sanitized = Self::sanitize_function_name(&td.name);
+                if sanitized != td.name {
+                    Some((sanitized, td.name.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
     /// Extract content blocks and usage from a completed Gemini response body.
     fn parse_response_body(
         &self,
         body: &Value,
         model: &str,
+        name_map: &std::collections::HashMap<String, String>,
     ) -> Result<ProviderResponse, ProviderError> {
         let candidates = body
             .get("candidates")
@@ -555,11 +596,12 @@ impl GoogleProvider {
                         text: text.to_string(),
                     });
                 } else if let Some(fc) = part.get("functionCall") {
-                    let name = fc
+                    let sanitized_name = fc
                         .get("name")
                         .and_then(|n| n.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let name = name_map.get(&sanitized_name).cloned().unwrap_or(sanitized_name);
                     let args = fc.get("args").cloned().unwrap_or(json!({}));
                     let occurrence = tool_name_counts
                         .entry(name.clone())
@@ -631,6 +673,7 @@ impl LlmProvider for GoogleProvider {
     ) -> Result<ProviderResponse, ProviderError> {
         let url = self.generate_url(&request.model);
         let model = request.model.clone();
+        let name_map = Self::build_sanitized_name_map(&request.tools);
         let body = self.build_request_body(&request);
 
         debug!("Google create_message: POST {}", url);
@@ -670,7 +713,7 @@ impl LlmProvider for GoogleProvider {
                 body: Some(resp_body.clone()),
             })?;
 
-        self.parse_response_body(&json_body, &model)
+        self.parse_response_body(&json_body, &model, &name_map)
     }
 
     async fn create_message_stream(
@@ -682,6 +725,7 @@ impl LlmProvider for GoogleProvider {
     > {
         let url = self.stream_url(&request.model);
         let model = request.model.clone();
+        let name_map = Self::build_sanitized_name_map(&request.tools);
         let body = self.build_request_body(&request);
 
         debug!("Google create_message_stream: POST {}", url);
@@ -714,6 +758,7 @@ impl LlmProvider for GoogleProvider {
         let provider_id_for_stream = self.id.clone();
         let model_clone = model.clone();
         let byte_stream = resp.bytes_stream();
+        let name_map_for_stream = name_map;
 
         let stream = async_stream::stream! {
             let mut byte_stream = byte_stream;
@@ -832,11 +877,12 @@ impl LlmProvider for GoogleProvider {
                                             text: text.to_string(),
                                         });
                                     } else if let Some(fc) = part.get("functionCall") {
-                                        let name = fc
+                                        let sanitized_name = fc
                                             .get("name")
                                             .and_then(|n| n.as_str())
                                             .unwrap_or("")
                                             .to_string();
+                                        let name = name_map_for_stream.get(&sanitized_name).cloned().unwrap_or(sanitized_name);
                                         let args_str = fc
                                             .get("args")
                                             .map(|a| a.to_string())
@@ -1184,7 +1230,7 @@ mod tests {
         });
 
         let parsed = provider
-            .parse_response_body(&response, "gemini-3-flash-preview")
+            .parse_response_body(&response, "gemini-3-flash-preview", &std::collections::HashMap::new())
             .expect("parsed response");
 
         assert!(matches!(
@@ -1246,7 +1292,7 @@ mod tests {
         });
 
         let parsed = provider
-            .parse_response_body(&response, "gemini-2.5-flash")
+            .parse_response_body(&response, "gemini-2.5-flash", &std::collections::HashMap::new())
             .expect("parsed response");
 
         assert!(matches!(
